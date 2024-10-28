@@ -14,6 +14,7 @@ from accelerate import (
     InitProcessGroupKwargs,
     find_executable_batch_size,
 )
+from accelerate.utils import get_max_memory
 from huggingface_hub import HfApi
 from packaging import version
 from peft import PeftModel
@@ -359,7 +360,6 @@ class HFLM(TemplateLM):
             eval_logger.info(
                 f"Loglikelihood prefix token id used in evaluation: {self.prefix_token_id}"
             )
-
 
     def _get_accelerate_args(
         self,
@@ -812,6 +812,7 @@ class HFLM(TemplateLM):
         # if OOM, then halves batch_size and tries again
         @find_executable_batch_size(starting_batch_size=self.max_batch_size)
         def forward_batch(batch_size):
+            security_margin = int(0.05 * security_margin_factor * batch_size)
             if self.AUTO_MODEL_CLASS == transformers.AutoModelForSeq2SeqLM:
                 length = max(max_context_enc, max_cont_enc)
                 batched_conts = torch.ones(
