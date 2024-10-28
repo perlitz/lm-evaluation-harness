@@ -234,7 +234,11 @@ class EvaluationTracker:
                 file_results_aggregated.open("w", encoding="utf-8").write(dumped)
 
                 if self.api and self.push_results_to_hub:
-                    repo_id = "open-llm-leaderboard/results" if self.public_repo else "open-llm-leaderboard/private-results"
+                    repo_id = (
+                        "open-llm-leaderboard/results"
+                        if self.public_repo
+                        else "open-llm-leaderboard/private-results"
+                    )
                     self.api.create_repo(
                         repo_id=repo_id,
                         repo_type="dataset",

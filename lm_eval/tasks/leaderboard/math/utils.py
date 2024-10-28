@@ -19,6 +19,7 @@ please install sympy via pip install lm-eval[math] or pip install -e .[math]",
 
 INVALID_ANSWER = "[invalidanswer]"
 
+
 # taken from
 # https://github.com/wellecks/lm-evaluation-harness/blob/master/lm_eval/tasks/minerva_math.py
 def doc_to_text(doc: dict) -> str:
@@ -72,10 +73,8 @@ def process_results(doc: dict, results: List[str]) -> Dict[str, int]:
     unnormalized_answer = get_unnormalized_answer(candidates)
     answer = normalize_final_answer(unnormalized_answer)
 
-
     if answer == INVALID_ANSWER:
         return {"exact_match": 0}
-
     if answer.strip() == doc["answer"].strip() or is_equiv(answer, doc["answer"]):
         retval = 1
     else:

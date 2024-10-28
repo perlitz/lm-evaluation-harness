@@ -1068,6 +1068,10 @@ class HFLM(TemplateLM):
         print(f"Determined largest batch size: {self.batch_sizes[sched]}")
         return self.batch_sizes[sched]
 
+    def _reset_batch_scheduler(self):
+        """When we change group in generative evaluations, we reset the batch size"""
+        self.batch_sizes = {}
+
     def _loglikelihood_tokens(
         self,
         requests: List[Tuple[Tuple[str, str], List[int], List[int]]],
