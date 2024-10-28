@@ -14,7 +14,6 @@ from accelerate import (
     InitProcessGroupKwargs,
     find_executable_batch_size,
 )
-from accelerate.utils import get_max_memory
 from huggingface_hub import HfApi
 from packaging import version
 from peft import PeftModel
@@ -32,6 +31,7 @@ from lm_eval.api.registry import register_model
 from lm_eval.models.utils import (
     Collator,
     clear_torch_cache,
+    configure_pad_token,
     get_dtype,
     pad_and_concat,
     stop_sequences_criteria,
@@ -39,6 +39,31 @@ from lm_eval.models.utils import (
 
 
 eval_logger = utils.eval_logger
+
+
+def _get_accelerate_args(
+    device_map_option: Optional[str] = "auto",
+    max_memory_per_gpu: Optional[Union[int, str]] = None,
+    max_cpu_memory: Optional[Union[int, str]] = None,
+    offload_folder: Optional[str] = "./offload",
+    gpus: Optional[int] = None,
+) -> dict:
+    """Returns the kwargs needed to apply `accelerate` in `AutoModel.from_pretrained`."""
+    max_memory = {}
+    if max_memory_per_gpu is not None:
+        max_memory_per_gpu_map = {
+            device_idx: max_memory_per_gpu for device_idx in range(gpus)
+        }
+        max_memory.update(max_memory_per_gpu_map)
+    if max_cpu_memory is not None:
+        max_memory["cpu"] = max_cpu_memory
+
+    args = {}
+    if max_memory:
+        args["max_memory"] = max_memory
+    args["device_map"] = device_map_option
+    args["offload_folder"] = offload_folder
+    return args
 
 
 @register_model("hf-auto", "hf", "huggingface")
@@ -81,6 +106,7 @@ class HFLM(TemplateLM):
         # arguments used for splitting a model across GPUs naively.
         # only used if `parallelize=True`.
         parallelize: Optional[bool] = False,
+        device_map_option: Optional[str] = "auto",
         max_memory_per_gpu: Optional[Union[int, str]] = None,
         max_cpu_memory: Optional[Union[int, str]] = None,
         offload_folder: Optional[Union[str, os.PathLike]] = "./offload",
@@ -104,6 +130,21 @@ class HFLM(TemplateLM):
             self._config = self._model.config
             gpus = 0
 
+            if tokenizer:
+                assert isinstance(
+                    tokenizer, transformers.PreTrainedTokenizer
+                ) or isinstance(tokenizer, transformers.PreTrainedTokenizerFast)
+                self.tokenizer = tokenizer
+            else:
+                # Get tokenizer
+                model_name = self._model.name_or_path
+                self.tokenizer = transformers.AutoTokenizer.from_pretrained(
+                    model_name,
+                    revision=revision,
+                    trust_remote_code=trust_remote_code,
+                    use_fast=use_fast_tokenizer,
+                )
+
         else:
             assert isinstance(device, str)
             assert isinstance(pretrained, str)
@@ -118,7 +159,6 @@ class HFLM(TemplateLM):
             if "npu" in accelerator.device.type:
                 gpus = torch.npu.device_count()
 
-            # using one process with no model parallelism
             if not (parallelize or accelerator.num_processes > 1):
                 # use user-passed device
                 device_list = set(
@@ -188,6 +228,7 @@ class HFLM(TemplateLM):
                 trust_remote_code=trust_remote_code,
                 parallelize=parallelize,
                 gpus=gpus,
+                device_map_option=device_map_option,
                 max_memory_per_gpu=max_memory_per_gpu,
                 max_cpu_memory=max_cpu_memory,
                 offload_folder=offload_folder,
@@ -202,32 +243,24 @@ class HFLM(TemplateLM):
             self.model.eval()
             self.model.tie_weights()
 
+        if isinstance(pretrained, str) and (gpus >= 1 or str(self.device) == "mps"):
+            # TODO: can remove this whole snippet except in the mps case, perhaps?
+            if not (parallelize or autogptq or hasattr(self, "accelerator")):
+                # place model onto device requested manually,
+                # if not using HF Accelerate or device_map
+                # or any other option that preloads model onto device
+                try:
+                    self.model.to(self.device)
+                except ValueError:
+                    eval_logger.debug(
+                        "Failed to place model onto specified device. This may be because the model is quantized via `bitsandbytes` or `device_map` is provided. If the desired GPU is being used, this message is safe to ignore."
+                    )
+
         self.truncation = truncation
         self.logits_cache = logits_cache
         self.vocab_size = self.tokenizer.vocab_size
         # select (or create) a pad token to use
-        if self.tokenizer.pad_token:
-            pass
-        elif self.tokenizer.unk_token:
-            self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
-        elif self.tokenizer.eos_token:
-            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
-        else:
-            if getattr(self.config, "model_type", None) == "qwen":
-                # Qwen's trust_remote_code tokenizer does not allow for adding special tokens
-                self.tokenizer.pad_token = "<|endoftext|>"
-            elif (
-                self.tokenizer.__class__.__name__ == "RWKVWorldTokenizer"
-                or self.tokenizer.__class__.__name__ == "Rwkv5Tokenizer"
-            ):
-                # The RWKV world tokenizer, does not allow for adding special tokens / setting the pad token (which is set as 0)
-                # The additional tokenizer name check is needed, as there exists rwkv4 models with neox tokenizer
-                # ---
-                # Note that the world tokenizer class name, might change in the future for the final huggingface merge
-                # https://github.com/huggingface/transformers/pull/26963
-                assert self.tokenizer.pad_token_id == 0
-            else:
-                self.tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+        self.tokenizer = configure_pad_token(self.tokenizer, model_config=self.config)
 
         self.add_bos_token = add_bos_token
         model_type = getattr(self.config, "model_type", None)
@@ -235,7 +268,7 @@ class HFLM(TemplateLM):
         if model_type in gemma_variants:
             self.add_bos_token = True
             eval_logger.info(
-                f"Model type is '{self.config.model_type}', a BOS token will be used as Gemma underperforms without it."
+                f"Model type is '{self.config.model_type}', part of the Gemma family--a BOS token will be used as Gemma underperforms without it."
             )
 
         self._max_length = max_length
@@ -326,6 +359,7 @@ class HFLM(TemplateLM):
             eval_logger.info(
                 f"Loglikelihood prefix token id used in evaluation: {self.prefix_token_id}"
             )
+
 
     def _get_accelerate_args(
         self,
@@ -571,6 +605,7 @@ class HFLM(TemplateLM):
         # (accelerate naive PP (device_map) options)
         parallelize: Optional[bool] = False,
         gpus: Optional[int] = None,
+        device_map_option: Optional[str] = "auto",
         max_memory_per_gpu: Optional[Union[int, str]] = None,
         max_cpu_memory: Optional[Union[int, str]] = None,
         offload_folder: Optional[str] = "./offload",
@@ -594,16 +629,25 @@ class HFLM(TemplateLM):
 
         model_kwargs = kwargs if kwargs else {}
 
-        model_kwargs.update(
-            self._get_accelerate_args(
-                parallelize=parallelize,
-                device_map=kwargs.get("device_map", None),
-                max_memory_per_gpu=max_memory_per_gpu,
-                max_cpu_memory=max_cpu_memory,
-                offload_folder=offload_folder,
-                gpus=gpus,
+        if parallelize:
+            model_kwargs.update(
+                self._get_accelerate_args(
+                    device_map_option,  # TODO: phase out device_map_option?
+                    max_memory_per_gpu,
+                    max_cpu_memory,
+                    offload_folder,
+                    gpus,
+                )
             )
-        )
+        elif "device_map" not in model_kwargs:
+            # set a device_map to initialize model on the right GPU.
+            # this is needed because it seems that the default behavior
+            # for quantized models now seems to be device_map="auto"
+            # which breaks data-parallel mode.
+            if hasattr(self, "accelerator"):
+                model_kwargs.update({"device_map": {"": f"{self.accelerator.device}"}})
+            else:
+                model_kwargs.update({"device_map": {"": str(self.device)}})
 
         if not autogptq:
             if model_kwargs.get("load_in_4bit", None):
@@ -616,7 +660,6 @@ class HFLM(TemplateLM):
                         model_kwargs["bnb_4bit_compute_dtype"] = get_dtype(
                             model_kwargs["bnb_4bit_compute_dtype"]
                         )
-
             self._model = self.AUTO_MODEL_CLASS.from_pretrained(
                 pretrained,
                 revision=revision,
@@ -769,11 +812,10 @@ class HFLM(TemplateLM):
         # if OOM, then halves batch_size and tries again
         @find_executable_batch_size(starting_batch_size=self.max_batch_size)
         def forward_batch(batch_size):
-            security_margin = int(0.05 * security_margin_factor * batch_size)
             if self.AUTO_MODEL_CLASS == transformers.AutoModelForSeq2SeqLM:
                 length = max(max_context_enc, max_cont_enc)
                 batched_conts = torch.ones(
-                    (batch_size + security_margin, length), device=self.device
+                    (batch_size, length), device=self.device
                 ).long()
                 test_batch = torch.ones(
                     (batch_size + security_margin, length), device=self.device
@@ -784,8 +826,8 @@ class HFLM(TemplateLM):
                 }
             else:
                 call_kwargs = {}
-                test_batch = torch.rand(
-                    (batch_size + security_margin, max_length), device=self.device
+                test_batch = torch.ones(
+                    (batch_size, max_length), device=self.device
                 ).long()
 
             for _ in range(5 * security_margin_factor):
@@ -1024,10 +1066,6 @@ class HFLM(TemplateLM):
         self.batch_sizes[sched] = self._detect_batch_size(n_reordered_requests, pos)
         print(f"Determined largest batch size: {self.batch_sizes[sched]}")
         return self.batch_sizes[sched]
-
-    def _reset_batch_scheduler(self):
-        """When we change group in generative evaluations, we reset the batch size"""
-        self.batch_sizes = {}
 
     def _loglikelihood_tokens(
         self,
@@ -1279,6 +1317,7 @@ class HFLM(TemplateLM):
             group_by="gen_kwargs",
             group_fn=lambda x: x[1],
         )
+
         chunks = re_ords.get_batched(
             n=batch_size, batch_fn=batch_fn, reset_batch_fn=self._reset_batch_scheduler
         )
@@ -1309,25 +1348,20 @@ class HFLM(TemplateLM):
                 until = [eos]
             else:
                 until.append(eos)
-
             if "max_gen_toks" in kwargs.keys():
                 max_gen_toks = kwargs.pop("max_gen_toks")
                 if (
                     max_gen_toks > self.max_length
                 ):  # some model have low max length limit
                     max_gen_toks = self.max_gen_toks
+
             else:
                 max_gen_toks = self.max_gen_toks
 
             # set the max length in tokens of inputs ("context_enc")
             if self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM:
                 # max len for inputs = max length, minus room to generate the max new tokens
-                # if the max new tokens is too large, halve it until it fits as we cannot change
-                # the max model length
                 max_ctx_len = self.max_length - max_gen_toks
-                while max_ctx_len <= 0:
-                    max_gen_toks = max_gen_toks // 2
-                    max_ctx_len = self.max_length - max_gen_toks
             elif self.AUTO_MODEL_CLASS == transformers.AutoModelForSeq2SeqLM:
                 # max len for inputs = encoder's whole max_length
                 max_ctx_len = self.max_length

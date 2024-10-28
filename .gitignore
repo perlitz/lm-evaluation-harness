@@ -73,6 +73,7 @@ data/
 .idea/
 .vscode/
 
+
 # Temporary files including logs
 temp/
 logs/

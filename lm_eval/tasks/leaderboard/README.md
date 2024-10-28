@@ -264,6 +264,14 @@ progress in the field.
 }
 ```
 
+### Groups
+
+- `leaderboard_mmlu_pro`
+
+### Tasks
+
+- `leaderboard_mmlu_pro`
+
 ## Musr
 
 ### Paper
