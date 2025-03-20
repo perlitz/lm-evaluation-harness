@@ -11,10 +11,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Download files from S3.")
 
     parser.add_argument(
-        "--input_model_paths",
-        nargs="+",
-        default=[],
-        help="List of model names to evaluate. (default: [])",
+        "--input_model_path",
+        type=str,
+        required=True,
+        help="Path to the input model directory.",
+    )
+    parser.add_argument(
+        "--model_save_dir",
+        type=str,
+        required=True,
+        help="Path to the output model directory.",
     )
 
     args = parser.parse_args()
@@ -25,7 +31,7 @@ if __name__ == "__main__":
             logger.info(f"No tokenizer files found for {input_model_path}, skipping")
             continue
 
-        out_model_dir_path = input_model_path + "-hf"
+        out_model_dir_path = args.model_save_dir + input_model_path + "-hf"
         convert_mamba_ssm_checkpoint_file_to_huggingface_model_file(
             input_model_path,
             "fp16",
